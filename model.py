@@ -33,10 +33,33 @@ class Model(torch.nn.Module):
         self.hyper = copy.deepcopy(params)
         self.init_trainable()
 
-    def forward(self, x):
-        raise NotImplementedError
+    def forward(self, walk: Walk, prev_iter=None):
+        # given an observation, and knowing the previous g (or starting from the beginning)
+        # construct a p from the outer product of these x and g
+        # feed into transformer and get a p for the next time step which is broken down into x and g
+        # g_curr = new g for the next iteration
+        # compare our x with ground truth observation x for loss
+        # is constructed/deconstructed outside of transformer though I think
 
-    def iteration(self, x):
+        steps = self.init_walks(prev_iter)
+        for g, x, a in walk:
+            if steps is None:
+                steps = [
+                    self.init_iteration(g, x, [None for _ in range(len(a))])
+                ]
+            L, M, g_gen, p_gen, x_gen, x_logits, x_inf, g_inf, p_inf = self.iteration(
+                x, g, steps[-1].a, steps[-1].M, steps[-1].x_inf, steps[-1].g_inf
+            )
+            steps.append(
+                Iteration(
+                    g, x, a, L, g_gen, p_gen, x_gen, x_logits, x_inf, g_inf, p_inf
+                )
+            )
+        steps = steps[1:]
+        return steps
+
+    def iteration(self, x, locations, a_prev, x_prev, g_prev):
+
         raise NotImplementedError
 
     def inference(self, x):
@@ -52,6 +75,25 @@ class Model(torch.nn.Module):
         raise NotImplementedError
 
 
+# TODO causal transformer
+
+class LayerNorm(nn.Module):
+    # in this case, use fixed weights (i.e. z-score)
+    def __init__(self, d_model, eps=1e-12):
+        super(LayerNorm, self).__init__()
+        #self.gamma = nn.Parameter(torch.ones(d_model))
+        #self.beta = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+
+    def forward(self, p):
+        mean = p.mean(-1, keepdim=True)
+        var = p.var(-1, unbiased=False, keepdim=True)
+        # '-1' means last dimension. 
+
+        out = (p - mean) / torch.sqrt(var + self.eps)
+        #out = self.gamma * out + self.beta
+        return out
+
 # Might need to rename since these are essentially g
 class PositionalEncoding(nn.Module):
     def __init__(self, params):
@@ -60,31 +102,37 @@ class PositionalEncoding(nn.Module):
         max_len = params["max_len"]
         d_model = params["d_model"]
 
+        self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(p=dropout)
-        self.pe = nn.Linear(
+        self.w_a = nn.Linear(
             max_len, d_model
         )  # dim was (max_len, 1, d_model) in original, may need to reshape
         # I think this also needs nonlinearity but it doesn't say what in the paper
         # look for other examples in the original TEM code of these learnable matrices
         # g_t+1 = f(g_t * W_a) where W_a is learnable action-dependent matrix
 
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Arguments:
-            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
-        """
-        x += self.pe
-        return self.dropout(x)  # do we still want a dropout?
+        # the thing is this is listed as an RNN but it seems simpler than that
+
+    def forward(self, g: Tensor) -> Tensor:
+        g = self.softmax(self.w_a(g))   # softmax before or after dropout?
+        return self.dropout(g)  # do we still want a dropout?
 
 
 class TransformerEmbedding(nn.Module):
     def __init__(self):
-        # combine a positional encoding w an embedding
+        # combine a positional encoding w a token embedding
         # paper mentions some embedding but not sure
-        raise NotImplementedError
+        super(TransformerEmbedding, self).__init__()
+        self.pos_emb = PositionalEncoding(params)
+        self.drop_out = nn.Dropout(p=drop_prob)
 
-    def forward(self, x):
-        raise NotImplementedError
+    def forward(self, p: Tuple):
+        # position (e) initialized as 0 and then recurrently generated, independent of x?
+        
+        pos_emb = self.pos_emb(p[1])
+        # TODO do dropout on both or neither?
+        return (p[0], pos_emb)
+       #return self.drop_out((tok_emb, pos_emb))
 
 
 class ScaleDotProductAttention(nn.Module):
@@ -100,14 +148,16 @@ class ScaleDotProductAttention(nn.Module):
         super(ScaleDotProductAttention, self).__init__()
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, q, k, v, mask=None, e=1e-12):
+    # TODO causal masking
+    # e_tild = q, k and x_tild = v
+    def forward(self, g, e_tild, x_tild, mask=None):
         # input is 4 dimension tensor
         # [batch_size, head, length, d_tensor]
-        batch_size, head, length, d_tensor = k.size()
+        # this will come from params I think
+        batch_size, head, length, d_tensor = 0, 0, 0, 0 #k.size()
 
-        # 1. dot product Query with Key^T to compute similarity
-        k_t = k.transpose(2, 3)  # transpose
-        score = (q @ k_t) / math.sqrt(d_tensor)  # scaled dot product
+        e_tild_t = e_tild.transpose(2, 3)
+        score = (g @ e_tild_t) / math.sqrt(d_tensor)
 
         # 2. apply masking (opt)
         if mask is not None:
@@ -117,9 +167,9 @@ class ScaleDotProductAttention(nn.Module):
         score = self.softmax(score)
 
         # 4. multiply with Value
-        v = score @ v
+        x_tild = score @ x_tild
 
-        return v, score
+        return x_tild, score
 
 
 class MultiHeadAttention(nn.Module):
@@ -127,24 +177,27 @@ class MultiHeadAttention(nn.Module):
         super(MultiHeadAttention, self).__init__()
         self.n_head = n_head
         self.attention = ScaleDotProductAttention()
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
+        # in TEM-t, keys and queries are treated as the same K, Q = EW_e
+        self.w_e = nn.Linear(d_model, d_model)
+        self.w_x = nn.Linear(d_model, d_model)
         self.w_concat = nn.Linear(d_model, d_model)
 
-    def forward(self, q, k, v, mask=None):
+    def forward(self, p: Tuple[Tensor, Tensor], mask=None):
         # 1. dot product with weight matrices
-        q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
+        # split H into E and X
+        g = p[1]
+        e_tild = self.w_e(p[1])
+        x_tild = self.w_x(p[0])
 
         # 2. split tensor by number of heads
-        q, k, v = self.split(q), self.split(k), self.split(v)
+        #q, k, v = self.split(q), self.split(k), self.split(v)
 
         # 3. do scale dot product to compute similarity
-        out, attention = self.attention(q, k, v, mask=mask)
+        out, attention = self.attention(g, e_tild, x_tild, mask=mask)
 
         # 4. concat and pass to linear layer
-        out = self.concat(out)
-        out = self.w_concat(out)
+        #out = self.concat(out)
+        #out = self.w_concat(out)
 
         # 5. visualize attention map
         # TODO : we should implement visualization
@@ -189,31 +242,31 @@ class EncoderLayer(nn.Module):
     def __init__(self, d_model, ffn_hidden, n_head, drop_prob):
         super(EncoderLayer, self).__init__()
         self.attention = MultiHeadAttention(d_model=d_model, n_head=n_head)
-        self.norm1 = LayerNorm(d_model=d_model)  # TODO replace w z-score
+        self.norm1 = LayerNorm(d_model=d_model)
         self.dropout1 = nn.Dropout(p=drop_prob)
 
         # TODO this is dumb replace
         # self.ffn = PositionwiseFeedForward(d_model=d_model, hidden=ffn_hidden, drop_prob=drop_prob)
-        self.norm2 = LayerNorm(d_model=d_model)  # TODO replace w z-score
+        self.norm2 = LayerNorm(d_model=d_model)
         self.dropout2 = nn.Dropout(p=drop_prob)
 
-    def forward(self, x, src_mask):
+    def forward(self, p, src_mask):
         # 1. compute self attention
-        _x = x
-        x = self.attention(q=x, k=x, v=x, mask=src_mask)
+        _p = p
+        p = self.attention(p, mask=src_mask)
 
         # 2. add and norm
-        x = self.dropout1(x)
-        x = self.norm1(x + _x)
+        p[1] = self.dropout1(p[1])
+        p[1] = self.norm1(p[1] + _p[1]) # just mentions norming on positional encoding
 
         # 3. positionwise feed forward network
-        _x = x
-        x = self.ffn(x)
+        _p = p
+        p = self.ffn(p)
 
         # 4. add and norm
-        x = self.dropout2(x)
-        x = self.norm2(x + _x)
-        return x
+        p[1] = self.dropout2(p[1])
+        p[1] = self.norm2(p[1] + _p[1])
+        return p
 
 
 class Encoder(nn.Module):
@@ -243,13 +296,73 @@ class Encoder(nn.Module):
             ]
         )
 
-    def forward(self, x, src_mask):
-        x = self.emb(x)
+    # p input as defined by outer product in paper
+    def forward(self, p, src_mask):
+        p = self.emb(p)
 
         for layer in self.layers:
-            x = layer(x, src_mask)
+            p = layer(p, src_mask)
 
-        return x
+        return p
+
+class PositionwiseFeedForward(nn.Module):
+
+    def __init__(self, d_model, hidden, drop_prob=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.linear1 = nn.Linear(d_model, hidden)
+        self.linear2 = nn.Linear(hidden, d_model)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=drop_prob)
+
+    def forward(self, p):
+        p = self.linear1(p)
+        p = self.relu(p)
+        p = self.dropout(p)
+        p = self.linear2(p)
+        return p
+
+class DecoderLayer(nn.Module):
+
+    def __init__(self, d_model, ffn_hidden, n_head, drop_prob):
+        super(DecoderLayer, self).__init__()
+        self.self_attention = MultiHeadAttention(d_model=d_model, n_head=n_head)
+        self.norm1 = LayerNorm(d_model=d_model)
+        self.dropout1 = nn.Dropout(p=drop_prob)
+
+        self.enc_dec_attention = MultiHeadAttention(d_model=d_model, n_head=n_head)
+        self.norm2 = LayerNorm(d_model=d_model)
+        self.dropout2 = nn.Dropout(p=drop_prob)
+
+        self.ffn = PositionwiseFeedForward(d_model=d_model, hidden=ffn_hidden, drop_prob=drop_prob)
+        self.norm3 = LayerNorm(d_model=d_model)
+        self.dropout3 = nn.Dropout(p=drop_prob)
+
+    def forward(self, dec, enc, trg_mask, src_mask):
+        # 1. compute self attention
+        _p = dec
+        p = self.self_attention(dec, mask=trg_mask)
+        
+        # 2. add and norm
+        p = self.dropout1(p)
+        p = self.norm1(p + _p)
+
+        if enc is not None:
+            # 3. compute encoder - decoder attention
+            _p = p
+            p = self.enc_dec_attention(p, mask=src_mask)
+            
+            # 4. add and norm
+            p = self.dropout2(p)
+            p = self.norm2(p + _p)
+
+        # 5. positionwise feed forward network
+        _p = p
+        p = self.ffn(p)
+        
+        # 6. add and norm
+        p = self.dropout3(p)
+        p = self.norm3(p + _p)
+        return p
 
 
 class Iteration:
